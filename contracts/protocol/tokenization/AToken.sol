@@ -266,7 +266,7 @@ contract AToken is
   /**
    * @dev Returns the address of the Aave treasury, receiving the fees on this aToken
    **/
-  function RESERVE_TREASURY_ADDRESS() public view returns (address) {
+  function RESERVE_TREASURY_ADDRESS() public view override returns (address) {
     return _treasury;
   }
 

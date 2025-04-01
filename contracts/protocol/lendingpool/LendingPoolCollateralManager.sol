@@ -43,8 +43,26 @@ contract LendingPoolCollateralManager is
   using ReserveConfiguration for DataTypes.ReserveConfigurationMap;
   using UserConfiguration for DataTypes.UserConfigurationMap;
 
-  uint256 internal constant LIQUIDATION_CLOSE_FACTOR_PERCENT = 5000;
+  /**
+   * @dev Default percentage of borrower's debt to be repaid in a liquidation.
+   * @dev Percentage applied when the users health factor is above `CLOSE_FACTOR_HF_THRESHOLD`
+   * Expressed in bps, a value of 0.5e4 results in 50.00%
+   */
+  uint256 internal constant DEFAULT_LIQUIDATION_CLOSE_FACTOR = 0.5e4;
 
+  /**
+   * @dev Maximum percentage of borrower's debt to be repaid in a liquidation
+   * @dev Percentage applied when the users health factor is below `CLOSE_FACTOR_HF_THRESHOLD`
+   * Expressed in bps, a value of 1e4 results in 100.00%
+   */
+  uint256 public constant MAX_LIQUIDATION_CLOSE_FACTOR = 1e4;
+
+  /**
+   * @dev This constant represents below which health factor value it is possible to liquidate
+   * an amount of debt corresponding to `MAX_LIQUIDATION_CLOSE_FACTOR`.
+   * A value of 0.95e18 results in 0.95
+   */
+  uint256 public constant CLOSE_FACTOR_HF_THRESHOLD = 0.95e18;
   struct LiquidationCallLocalVars {
     uint256 userCollateralBalance;
     uint256 userStableDebt;
@@ -126,8 +144,12 @@ contract LendingPoolCollateralManager is
 
     vars.userCollateralBalance = vars.collateralAtoken.balanceOf(user);
 
+    uint256 closeFactor = vars.healthFactor > CLOSE_FACTOR_HF_THRESHOLD
+      ? DEFAULT_LIQUIDATION_CLOSE_FACTOR
+      : MAX_LIQUIDATION_CLOSE_FACTOR;
+
     vars.maxLiquidatableDebt = vars.userStableDebt.add(vars.userVariableDebt).percentMul(
-      LIQUIDATION_CLOSE_FACTOR_PERCENT
+      closeFactor
     );
 
     vars.actualDebtToLiquidate = debtToCover > vars.maxLiquidatableDebt
@@ -197,9 +219,14 @@ contract LendingPoolCollateralManager is
       0
     );
 
+    // split
+    uint256 liquidationProtocolFeeAmount = vars.maxCollateralToLiquidate.div(2);
+
     if (receiveAToken) {
       vars.liquidatorPreviousATokenBalance = IERC20(vars.collateralAtoken).balanceOf(msg.sender);
-      vars.collateralAtoken.transferOnLiquidation(user, msg.sender, vars.maxCollateralToLiquidate);
+
+      vars.collateralAtoken.transferOnLiquidation(user, msg.sender, vars.maxCollateralToLiquidate.sub(liquidationProtocolFeeAmount));
+      // vars.collateralAtoken.transferOnLiquidation(user, msg.sender, vars.maxCollateralToLiquidate);
 
       if (vars.liquidatorPreviousATokenBalance == 0) {
         DataTypes.UserConfigurationMap storage liquidatorConfig = _usersConfig[msg.sender];
@@ -215,13 +242,31 @@ contract LendingPoolCollateralManager is
         vars.maxCollateralToLiquidate
       );
 
-      // Burn the equivalent amount of aToken, sending the underlying to the liquidator
+      // Burn the the other half of equivalent amount of aToken, sending the underlying to the liquidator
       vars.collateralAtoken.burn(
         user,
         msg.sender,
-        vars.maxCollateralToLiquidate,
+        vars.maxCollateralToLiquidate.sub(liquidationProtocolFeeAmount),
         collateralReserve.liquidityIndex
       );
+      // vars.collateralAtoken.burn(
+      //   user,
+      //   msg.sender,
+      //   vars.maxCollateralToLiquidate,
+      //   collateralReserve.liquidityIndex
+      // );
+    }
+
+    // Send the other half of the collateral to the treasury
+    if (liquidationProtocolFeeAmount != 0) {
+      uint256 liquidityIndex = collateralReserve.getNormalizedIncome();
+      uint256 scaledDownLiquidationProtocolFee = liquidationProtocolFeeAmount.rayDiv(liquidityIndex);
+      uint256 scaledDownUserBalance = vars.collateralAtoken.scaledBalanceOf(user);
+      // To avoid trying to send more aTokens than available on balance, due to 1 wei imprecision
+      if (scaledDownLiquidationProtocolFee > scaledDownUserBalance) {
+        liquidationProtocolFeeAmount = scaledDownUserBalance.rayMul(liquidityIndex);
+      }
+      vars.collateralAtoken.transferOnLiquidation(user, vars.collateralAtoken.RESERVE_TREASURY_ADDRESS(), liquidationProtocolFeeAmount);
     }
 
     // If the collateral being liquidated is equal to the user balance,
